@@ -1,17 +1,17 @@
 #!/bin/bash
 
 # ==============================================================================
-# Nginx 劫持与 DNS 修改一键部署/卸载脚本
+# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v2
 # 功能:
-# 1. 劫持 http://www.gstatic.com/generate_204 请求
+# 1. 使用 iptables 和 Nginx 透明代理劫持 HTTP 流量
 # 2. 修改系统 DNS 为 1.1.1.1 和 8.8.8.8
 # 支持系统: Ubuntu / Debian
 # ==============================================================================
 
 # --- 配置 ---
-HIJACK_DOMAIN="www.gstatic.com"
-NGINX_CONF_FILE="/etc/nginx/conf.d/gstatic_hijack.conf"
-HOSTS_ENTRY="127.0.0.1 $HIJACK_DOMAIN"
+NGINX_CONF_FILE="/etc/nginx/conf.d/transparent_proxy.conf"
+PROXY_PORT="8888" # Nginx 监听的代理端口
+NGINX_USER="www-data" # Ubuntu/Debian 上 Nginx 默认的运行用户
 RESOLVED_CONF_FILE="/etc/systemd/resolved.conf"
 RESOLVED_CONF_BACKUP="$RESOLVED_CONF_FILE.bak_$(date +%Y%m%d_%H%M%S)"
 PRIMARY_DNS="1.1.1.1"
@@ -19,7 +19,6 @@ SECONDARY_DNS="8.8.8.8"
 
 # --- 函数定义 ---
 
-# 打印消息
 log_info() {
     echo "✅ [INFO] $1"
 }
@@ -28,7 +27,6 @@ log_error() {
     echo "❌ [ERROR] $1" >&2
 }
 
-# 检查是否以root权限运行
 check_root() {
     if [ "$EUID" -ne 0 ]; then
         log_error "此脚本需要root权限。请使用 'sudo bash $0'"
@@ -38,17 +36,13 @@ check_root() {
 
 # 安装部署函数
 do_install() {
-    log_info "开始部署 Nginx 劫持与 DNS 修改..."
+    log_info "开始部署透明代理与 DNS 修改..."
 
-    # 1. 检查并安装 Nginx
-    if ! command -v nginx &> /dev/null; then
-        log_info "未检测到 Nginx，正在自动安装..."
-        apt-get update
-        apt-get install -y nginx
-        log_info "Nginx 安装完成。"
-    else
-        log_info "Nginx 已安装。"
-    fi
+    # 1. 安装依赖: Nginx 和 iptables-persistent
+    log_info "正在检查并安装依赖 (nginx, iptables-persistent)..."
+    apt-get update > /dev/null
+    apt-get install -y nginx iptables-persistent > /dev/null
+    log_info "依赖安装完成。"
 
     # 2. 修改系统 DNS
     log_info "正在配置系统 DNS..."
@@ -56,96 +50,117 @@ do_install() {
         cp "$RESOLVED_CONF_FILE" "$RESOLVED_CONF_BACKUP"
         log_info "已备份当前 DNS 配置到: $RESOLVED_CONF_BACKUP"
     fi
-    
-    # 使用 sed 更新或添加 DNS 设置
     sed -i -e "s/^#*DNS=.*/DNS=$PRIMARY_DNS $SECONDARY_DNS/" \
            -e "s/^#*FallbackDNS=.*/FallbackDNS=/" \
            "$RESOLVED_CONF_FILE"
-    
-    # 确保 DNS 配置存在
     if ! grep -q "^DNS=" "$RESOLVED_CONF_FILE"; then
         echo "DNS=$PRIMARY_DNS $SECONDARY_DNS" >> "$RESOLVED_CONF_FILE"
     fi
-
     log_info "已将 DNS 修改为 $PRIMARY_DNS (备用: $SECONDARY_DNS)。"
-    log_info "正在重启 systemd-resolved 服务..."
     systemctl restart systemd-resolved
+    log_info "DNS 服务已重启。"
 
-    # 3. 修改 /etc/hosts 文件
-    if ! grep -qF "$HOSTS_ENTRY" /etc/hosts; then
-        log_info "正在将 '$HOSTS_ENTRY' 添加到 /etc/hosts..."
-        echo -e "\n# Added by gstatic_hijack script\n$HOSTS_ENTRY" >> /etc/hosts
-    else
-        log_info "'$HOSTS_ENTRY' 已存在于 /etc/hosts 中。"
-    fi
-
-    # 4. 创建 Nginx 配置文件
-    log_info "正在创建 Nginx 配置文件: $NGINX_CONF_FILE"
+    # 3. 创建 Nginx 透明代理配置文件
+    log_info "正在创建 Nginx 透明代理配置文件: $NGINX_CONF_FILE"
     cat > "$NGINX_CONF_FILE" <<EOF
 # 由 setup_gstatic_hijack.sh 脚本自动生成
+
+# 劫持 www.gstatic.com 的特定请求
 server {
-    listen 80;
-    server_name $HIJACK_DOMAIN;
+    listen ${PROXY_PORT};
+    server_name www.gstatic.com;
+
     access_log /var/log/nginx/gstatic_hijack.access.log;
     error_log /var/log/nginx/gstatic_hijack.error.log;
+
     location = /generate_204 {
         return 204;
     }
+
+    # 对于 www.gstatic.com 的其他请求，正常代理
     location / {
-        return 404;
+        proxy_pass http://www.gstatic.com;
+        proxy_set_header Host "www.gstatic.com";
     }
+}
+
+# 默认服务，透明代理所有其他 HTTP 流量
+server {
+    listen ${PROXY_PORT} default_server;
+
+    resolver $PRIMARY_DNS $SECONDARY_DNS valid=300s;
+    resolver_timeout 5s;
+    
+    # 将请求代理到其原始目标地址
+    # \$host 变量包含来自 Host 头的原始域名
+    proxy_pass http://\$host\$request_uri;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
 }
 EOF
 
-    # 5. 测试并重载 Nginx
-    log_info "正在测试 Nginx 配置..."
+    # 4. 设置 iptables 流量重定向规则
+    log_info "正在设置 iptables 流量重定向规则 (端口 80 -> ${PROXY_PORT})..."
+    
+    # 为确保幂等性，先尝试删除旧规则，忽略错误
+    iptables -t nat -D OUTPUT -p tcp --dport 80 -m owner ! --uid-owner ${NGINX_USER} -j REDIRECT --to-port ${PROXY_PORT} 2>/dev/null
+    
+    # 添加规则
+    iptables -t nat -A OUTPUT -p tcp --dport 80 -m owner ! --uid-owner ${NGINX_USER} -j REDIRECT --to-port ${PROXY_PORT}
+    
+    # 5. 保存 iptables 规则并重载 Nginx
+    log_info "正在永久保存 iptables 规则..."
+    iptables-save > /etc/iptables/rules.v4
+
+    log_info "正在测试并重载 Nginx..."
     if nginx -t; then
-        log_info "Nginx 配置有效，正在重载服务..."
         systemctl reload nginx
     else
-        log_error "Nginx 配置测试失败。"
+        log_error "Nginx 配置测试失败。请检查 $NGINX_CONF_FILE 文件。"
         exit 1
     fi
 
     echo ""
     log_info "🎉 部署成功！"
-    log_info "DNS 和 Nginx 劫持均已配置。"
+    log_info "现在，本机所有的出站 HTTP (80) 流量都将被透明代理。"
+    log_info "您可以使用以下命令进行测试:"
+    echo "  curl -v http://www.gstatic.com/generate_204  (应返回 204)"
+    echo "  curl -I http://example.com  (应正常返回)"
     log_info "如需卸载，请运行: sudo bash $0 --uninstall"
 }
 
 # 卸载函数
 do_uninstall() {
-    log_info "开始卸载 Nginx 劫持与 DNS 修改..."
+    log_info "开始卸载透明代理与 DNS 修改..."
 
     # 1. 恢复 DNS 配置
     BACKUP_FILE=$(ls -t "$RESOLVED_CONF_FILE.bak_"* 2>/dev/null | head -n 1)
     if [ -n "$BACKUP_FILE" ] && [ -f "$BACKUP_FILE" ]; then
         log_info "正在从备份恢复 DNS 配置: $BACKUP_FILE"
         mv "$BACKUP_FILE" "$RESOLVED_CONF_FILE"
-        log_info "正在重启 systemd-resolved 服务..."
         systemctl restart systemd-resolved
+        log_info "DNS 服务已重启并恢复。"
     else
         log_info "未找到 DNS 备份文件，跳过恢复。"
     fi
 
-    # 2. 删除 Nginx 配置文件
+    # 2. 移除 iptables 规则
+    log_info "正在移除 iptables 流量重定向规则..."
+    iptables -t nat -D OUTPUT -p tcp --dport 80 -m owner ! --uid-owner ${NGINX_USER} -j REDIRECT --to-port ${PROXY_PORT} 2>/dev/null
+    iptables-save > /etc/iptables/rules.v4
+    log_info "iptables 规则已移除并保存。"
+    
+    # 3. 删除 Nginx 配置文件
     if [ -f "$NGINX_CONF_FILE" ]; then
         rm -f "$NGINX_CONF_FILE"
         log_info "已删除 Nginx 配置文件。"
     fi
-
-    # 3. 从 /etc/hosts 文件中移除相关条目
-    if grep -qF "$HOSTS_ENTRY" /etc/hosts; then
-        log_info "正在从 /etc/hosts 中移除劫持条目..."
-        sed -i "/$HOSTS_ENTRY/d" /etc/hosts
-        sed -i "/# Added by gstatic_hijack script/d" /etc/hosts
-    fi
-
-    # 4. 测试并重载 Nginx
-    log_info "正在测试并重载 Nginx 以应用更改..."
+    
+    # 4. 重载 Nginx
+    log_info "正在重载 Nginx 以应用更改..."
     if nginx -t; then
         systemctl reload nginx
-        log_info "Nginx 已重载。"
     else
         log_error "Nginx 配置测试失败，可能需要您手动修复。"
     fi
