@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v2
+# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v3
 # 功能:
 # 1. 使用 iptables 和 Nginx 透明代理劫持 HTTP 流量
 # 2. 修改系统 DNS 为 1.1.1.1 和 8.8.8.8
@@ -36,12 +36,16 @@ check_root() {
 
 # 安装部署函数
 do_install() {
-    log_info "开始部署透明代理与 DNS 修改..."
+    log_info "开始部署透明代理与 DNS 修改 (v3)..."
 
     # 1. 安装依赖: Nginx 和 iptables-persistent
     log_info "正在检查并安装依赖 (nginx, iptables-persistent)..."
-    apt-get update > /dev/null
-    apt-get install -y nginx iptables-persistent > /dev/null
+    export DEBIAN_FRONTEND=noninteractive
+    if ! apt-get update || ! apt-get install -y nginx iptables-persistent; then
+        log_error "依赖安装失败。请检查您的网络连接和 apt 软件源。"
+        log_error "您可以尝试手动运行 'apt-get update' 来定位问题。"
+        exit 1
+    fi
     log_info "依赖安装完成。"
 
     # 2. 修改系统 DNS
@@ -63,9 +67,9 @@ do_install() {
     # 3. 创建 Nginx 透明代理配置文件
     log_info "正在创建 Nginx 透明代理配置文件: $NGINX_CONF_FILE"
     cat > "$NGINX_CONF_FILE" <<EOF
-# 由 setup_gstatic_hijack.sh 脚本自动生成
+# 由 setup_gstatic_hijack.sh 脚本自动生成 (v3)
 
-# 劫持 www.gstatic.com 的特定请求
+# Server 1: 劫持 www.gstatic.com 的特定请求
 server {
     listen ${PROXY_PORT};
     server_name www.gstatic.com;
@@ -81,32 +85,31 @@ server {
     location / {
         proxy_pass http://www.gstatic.com;
         proxy_set_header Host "www.gstatic.com";
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
 
-# 默认服务，透明代理所有其他 HTTP 流量
+# Server 2: 默认服务，透明代理所有其他 HTTP 流量
 server {
     listen ${PROXY_PORT} default_server;
 
     resolver $PRIMARY_DNS $SECONDARY_DNS valid=300s;
     resolver_timeout 5s;
     
-    # 将请求代理到其原始目标地址
-    # \$host 变量包含来自 Host 头的原始域名
-    proxy_pass http://\$host\$request_uri;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    # 修正: proxy_pass 必须在 location 块中
+    location / {
+        proxy_pass http://\$host\$request_uri;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
 }
 EOF
 
     # 4. 设置 iptables 流量重定向规则
     log_info "正在设置 iptables 流量重定向规则 (端口 80 -> ${PROXY_PORT})..."
-    
-    # 为确保幂等性，先尝试删除旧规则，忽略错误
     iptables -t nat -D OUTPUT -p tcp --dport 80 -m owner ! --uid-owner ${NGINX_USER} -j REDIRECT --to-port ${PROXY_PORT} 2>/dev/null
-    
-    # 添加规则
     iptables -t nat -A OUTPUT -p tcp --dport 80 -m owner ! --uid-owner ${NGINX_USER} -j REDIRECT --to-port ${PROXY_PORT}
     
     # 5. 保存 iptables 规则并重载 Nginx
