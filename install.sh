@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v3
+# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v4 (最终修复版)
 # 功能:
 # 1. 使用 iptables 和 Nginx 透明代理劫持 HTTP 流量
 # 2. 修改系统 DNS 为 1.1.1.1 和 8.8.8.8
+# 3. 增加严格的依赖安装检查
 # 支持系统: Ubuntu / Debian
 # ==============================================================================
 
@@ -36,14 +37,21 @@ check_root() {
 
 # 安装部署函数
 do_install() {
-    log_info "开始部署透明代理与 DNS 修改 (v3)..."
+    log_info "开始部署透明代理与 DNS 修改 (v4)..."
 
     # 1. 安装依赖: Nginx 和 iptables-persistent
-    log_info "正在检查并安装依赖 (nginx, iptables-persistent)..."
+    log_info "正在更新 apt 软件源..."
     export DEBIAN_FRONTEND=noninteractive
-    if ! apt-get update || ! apt-get install -y nginx iptables-persistent; then
-        log_error "依赖安装失败。请检查您的网络连接和 apt 软件源。"
-        log_error "您可以尝试手动运行 'apt-get update' 来定位问题。"
+    if ! apt-get update; then
+        log_error "apt-get update 失败！"
+        log_error "这通常是由于网络连接问题或软件源配置错误导致的。"
+        log_error "请检查您的服务器网络连接，并尝试手动运行 'apt-get update' 来定位问题。"
+        exit 1
+    fi
+    
+    log_info "正在安装依赖 (nginx, iptables-persistent)..."
+    if ! apt-get install -y nginx iptables-persistent; then
+        log_error "依赖安装 (nginx, iptables-persistent) 失败！"
         exit 1
     fi
     log_info "依赖安装完成。"
@@ -67,7 +75,7 @@ do_install() {
     # 3. 创建 Nginx 透明代理配置文件
     log_info "正在创建 Nginx 透明代理配置文件: $NGINX_CONF_FILE"
     cat > "$NGINX_CONF_FILE" <<EOF
-# 由 setup_gstatic_hijack.sh 脚本自动生成 (v3)
+# 由 setup_gstatic_hijack.sh 脚本自动生成 (v4)
 
 # Server 1: 劫持 www.gstatic.com 的特定请求
 server {
@@ -127,9 +135,6 @@ EOF
     echo ""
     log_info "🎉 部署成功！"
     log_info "现在，本机所有的出站 HTTP (80) 流量都将被透明代理。"
-    log_info "您可以使用以下命令进行测试:"
-    echo "  curl -v http://www.gstatic.com/generate_204  (应返回 204)"
-    echo "  curl -I http://example.com  (应正常返回)"
     log_info "如需卸载，请运行: sudo bash $0 --uninstall"
 }
 
@@ -144,8 +149,6 @@ do_uninstall() {
         mv "$BACKUP_FILE" "$RESOLVED_CONF_FILE"
         systemctl restart systemd-resolved
         log_info "DNS 服务已重启并恢复。"
-    else
-        log_info "未找到 DNS 备份文件，跳过恢复。"
     fi
 
     # 2. 移除 iptables 规则
