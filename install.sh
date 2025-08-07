@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ==============================================================================
-# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v4 (最终修复版)
+# 透明代理劫持与 DNS 修改一键部署/卸载脚本 v5 (软件源修复版)
 # 功能:
-# 1. 使用 iptables 和 Nginx 透明代理劫持 HTTP 流量
-# 2. 修改系统 DNS 为 1.1.1.1 和 8.8.8.8
-# 3. 增加严格的依赖安装检查
+# 1. 自动修复失效的 bullseye-backports 软件源
+# 2. 使用 iptables 和 Nginx 透明代理劫持 HTTP 流量
+# 3. 修改系统 DNS 为 1.1.1.1 和 8.8.8.8
 # 支持系统: Ubuntu / Debian
 # ==============================================================================
 
@@ -17,6 +17,8 @@ RESOLVED_CONF_FILE="/etc/systemd/resolved.conf"
 RESOLVED_CONF_BACKUP="$RESOLVED_CONF_FILE.bak_$(date +%Y%m%d_%H%M%S)"
 PRIMARY_DNS="1.1.1.1"
 SECONDARY_DNS="8.8.8.8"
+SOURCES_LIST_DIR="/etc/apt/sources.list.d"
+MAIN_SOURCES_LIST="/etc/apt/sources.list"
 
 # --- 函数定义 ---
 
@@ -35,17 +37,44 @@ check_root() {
     fi
 }
 
+# 自动修复失效的软件源
+fix_apt_sources() {
+    log_info "正在检查并修复失效的 'bullseye-backports' 软件源..."
+    
+    # 定义要查找和注释的模式
+    local pattern="bullseye-backports"
+    
+    # 查找并处理主 sources.list 文件
+    if grep -q "$pattern" "$MAIN_SOURCES_LIST"; then
+        log_info "在 $MAIN_SOURCES_LIST 中发现失效源，正在创建备份并注释..."
+        cp "$MAIN_SOURCES_LIST" "$MAIN_SOURCES_LIST.bak_$(date +%Y%m%d_%H%M%S)"
+        sed -i -E "s|^(.*$pattern.*)|# \1 (Commented out by script)|" "$MAIN_SOURCES_LIST"
+    fi
+    
+    # 查找并处理 sources.list.d 目录下的文件
+    if [ -d "$SOURCES_LIST_DIR" ]; then
+        for file in $(grep -lr "$pattern" "$SOURCES_LIST_DIR"); do
+            log_info "在 $file 中发现失效源，正在创建备份并注释..."
+            cp "$file" "$file.bak_$(date +%Y%m%d_%H%M%S)"
+            sed -i -E "s|^(.*$pattern.*)|# \1 (Commented out by script)|" "$file"
+        done
+    fi
+    log_info "软件源检查修复完成。"
+}
+
+
 # 安装部署函数
 do_install() {
-    log_info "开始部署透明代理与 DNS 修改 (v4)..."
+    log_info "开始部署透明代理与 DNS 修改 (v5)..."
 
-    # 1. 安装依赖: Nginx 和 iptables-persistent
+    # 0. 修复软件源
+    fix_apt_sources
+
+    # 1. 更新 apt 并安装依赖
     log_info "正在更新 apt 软件源..."
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update; then
-        log_error "apt-get update 失败！"
-        log_error "这通常是由于网络连接问题或软件源配置错误导致的。"
-        log_error "请检查您的服务器网络连接，并尝试手动运行 'apt-get update' 来定位问题。"
+        log_error "apt-get update 失败！请检查您的网络连接和软件源配置。"
         exit 1
     fi
     
@@ -75,21 +104,11 @@ do_install() {
     # 3. 创建 Nginx 透明代理配置文件
     log_info "正在创建 Nginx 透明代理配置文件: $NGINX_CONF_FILE"
     cat > "$NGINX_CONF_FILE" <<EOF
-# 由 setup_gstatic_hijack.sh 脚本自动生成 (v4)
-
-# Server 1: 劫持 www.gstatic.com 的特定请求
+# 由 setup_gstatic_hijack.sh 脚本自动生成 (v5)
 server {
     listen ${PROXY_PORT};
     server_name www.gstatic.com;
-
-    access_log /var/log/nginx/gstatic_hijack.access.log;
-    error_log /var/log/nginx/gstatic_hijack.error.log;
-
-    location = /generate_204 {
-        return 204;
-    }
-
-    # 对于 www.gstatic.com 的其他请求，正常代理
+    location = /generate_204 { return 204; }
     location / {
         proxy_pass http://www.gstatic.com;
         proxy_set_header Host "www.gstatic.com";
@@ -97,15 +116,10 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }
 }
-
-# Server 2: 默认服务，透明代理所有其他 HTTP 流量
 server {
     listen ${PROXY_PORT} default_server;
-
     resolver $PRIMARY_DNS $SECONDARY_DNS valid=300s;
     resolver_timeout 5s;
-    
-    # 修正: proxy_pass 必须在 location 块中
     location / {
         proxy_pass http://\$host\$request_uri;
         proxy_set_header Host \$host;
@@ -134,13 +148,15 @@ EOF
 
     echo ""
     log_info "🎉 部署成功！"
-    log_info "现在，本机所有的出站 HTTP (80) 流量都将被透明代理。"
     log_info "如需卸载，请运行: sudo bash $0 --uninstall"
 }
 
 # 卸载函数
 do_uninstall() {
     log_info "开始卸载透明代理与 DNS 修改..."
+
+    # 卸载时不需要恢复软件源，因为注释掉是无害的
+    log_info "注意：脚本不会自动恢复被注释的软件源。如有需要，请手动编辑相关文件。"
 
     # 1. 恢复 DNS 配置
     BACKUP_FILE=$(ls -t "$RESOLVED_CONF_FILE.bak_"* 2>/dev/null | head -n 1)
